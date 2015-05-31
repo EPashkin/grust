@@ -1,6 +1,6 @@
 // This file is part of Grust, GObject introspection bindings for Rust
 //
-// Copyright (C) 2014  Mikhail Zabaluev <mikhail.zabaluev@gmail.com>
+// Copyright (C) 2014, 2015  Mikhail Zabaluev <mikhail.zabaluev@gmail.com>
 //
 // This library is free software; you can redistribute it and/or
 // modify it under the terms of the GNU Lesser General Public
@@ -18,11 +18,20 @@
 
 use refcount::{Refcount, Ref};
 use types::FALSE;
+use types::{gboolean, gint, gpointer};
 use wrap;
 use wrap::Wrapper;
 
 use glib as ffi;
 use gobject;
+use std::boxed::into_raw as box_into_raw;
+use std::mem;
+
+pub const PRIORITY_DEFAULT      : gint = ffi::G_PRIORITY_DEFAULT;
+pub const PRIORITY_DEFAULT_IDLE : gint = ffi::G_PRIORITY_DEFAULT_IDLE;
+pub const PRIORITY_HIGH         : gint = ffi::G_PRIORITY_HIGH;
+pub const PRIORITY_HIGH_IDLE    : gint = ffi::G_PRIORITY_HIGH_IDLE;
+pub const PRIORITY_LOW          : gint = ffi::G_PRIORITY_LOW;
 
 #[repr(C)]
 pub struct MainContext {
@@ -35,10 +44,45 @@ unsafe impl Wrapper for MainContext {
     type Raw = ffi::GMainContext;
 }
 
+extern "C" fn source_func<F>(callback_data: gpointer) -> gboolean
+    where F: FnMut() -> bool
+{
+    let mut callback: Box<F> = unsafe { Box::from_raw(callback_data as *mut F) };
+    let res = callback();
+    mem::forget(callback);
+    res as gboolean
+}
+
+extern "C" fn source_destroy_notify<F>(callback_data: gpointer)
+    where F: FnMut() -> bool
+{
+    let callback: Box<F> = unsafe { Box::from_raw(callback_data as *mut F) };
+    mem::drop(callback);
+}
+
 impl MainContext {
     pub fn default() -> &'static MainContext {
         unsafe {
             wrap::from_raw(ffi::g_main_context_default())
+        }
+    }
+
+    pub fn invoke<F>(&self, callback: F)
+        where F: Send + 'static, F: FnMut() -> bool
+    {
+        self.invoke_full(PRIORITY_DEFAULT, callback)
+    }
+
+    pub fn invoke_full<F>(&self, priority: gint, callback: F)
+        where F: Send + 'static, F: FnMut() -> bool
+    {
+        let boxed_cb = Box::new(callback);
+        unsafe {
+            ffi::g_main_context_invoke_full(self.as_mut_ptr(),
+                    priority,
+                    source_func::<F>,
+                    box_into_raw(boxed_cb) as gpointer,
+                    Some(source_destroy_notify::<F>));
         }
     }
 }

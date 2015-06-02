@@ -60,6 +60,27 @@ extern "C" fn source_destroy_notify<F>(callback_data: gpointer)
     mem::drop(callback);
 }
 
+extern "C" fn invoke_once_func<F>(callback_data: gpointer) -> gboolean
+    where F: FnOnce()
+{
+    let mut cbb: Box<Option<F>> = unsafe {
+        Box::from_raw(callback_data as *mut Option<F>)
+    };
+    let callback = cbb.take().expect("a callback closure expected");
+    mem::forget(cbb);
+    callback();
+    FALSE
+}
+
+extern "C" fn invoke_once_destroy_notify<F>(callback_data: gpointer)
+    where F: FnOnce()
+{
+    let cbb: Box<Option<F>> = unsafe {
+        Box::from_raw(callback_data as *mut Option<F>)
+    };
+    mem::drop(cbb);
+}
+
 impl MainContext {
     pub fn default() -> &'static MainContext {
         unsafe {
@@ -83,6 +104,25 @@ impl MainContext {
                     source_func::<F>,
                     box_into_raw(boxed_cb) as gpointer,
                     Some(source_destroy_notify::<F>));
+        }
+    }
+
+    pub fn invoke_once<F>(&self, callback: F)
+        where F: Send + 'static, F: FnOnce()
+    {
+        self.invoke_once_full(PRIORITY_DEFAULT, callback)
+    }
+
+    pub fn invoke_once_full<F>(&self, priority: gint, callback: F)
+        where F: Send + 'static, F: FnOnce()
+    {
+        let boxed_cb = Box::new(Some(callback));
+        unsafe {
+            ffi::g_main_context_invoke_full(self.as_mut_ptr(),
+                    priority,
+                    invoke_once_func::<F>,
+                    box_into_raw(boxed_cb) as gpointer,
+                    Some(invoke_once_destroy_notify::<F>));
         }
     }
 }

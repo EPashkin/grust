@@ -17,7 +17,7 @@
 // Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301  USA
 
 use refcount::{Refcount, Ref};
-use types::FALSE;
+use types::{FALSE, TRUE};
 use types::{gboolean, gint, gpointer};
 use wrap;
 use wrap::Wrapper;
@@ -33,6 +33,9 @@ pub const PRIORITY_HIGH         : gint = ffi::G_PRIORITY_HIGH;
 pub const PRIORITY_HIGH_IDLE    : gint = ffi::G_PRIORITY_HIGH_IDLE;
 pub const PRIORITY_LOW          : gint = ffi::G_PRIORITY_LOW;
 
+pub enum CallbackResult { Remove, Continue }
+pub use self::CallbackResult::*;
+
 #[repr(C)]
 pub struct MainContext {
     raw: ffi::GMainContext
@@ -45,16 +48,19 @@ unsafe impl Wrapper for MainContext {
 }
 
 extern "C" fn source_func<F>(callback_data: gpointer) -> gboolean
-    where F: FnMut() -> bool
+    where F: FnMut() -> CallbackResult
 {
     let mut callback: Box<F> = unsafe { Box::from_raw(callback_data as *mut F) };
     let res = callback();
     mem::forget(callback);
-    res as gboolean
+    match res {
+        Remove => FALSE,
+        Continue => TRUE
+    }
 }
 
 extern "C" fn source_destroy_notify<F>(callback_data: gpointer)
-    where F: FnMut() -> bool
+    where F: FnMut() -> CallbackResult
 {
     let callback: Box<F> = unsafe { Box::from_raw(callback_data as *mut F) };
     mem::drop(callback);
@@ -89,13 +95,13 @@ impl MainContext {
     }
 
     pub fn invoke<F>(&self, callback: F)
-        where F: Send + 'static, F: FnMut() -> bool
+        where F: Send + 'static, F: FnMut() -> CallbackResult
     {
         self.invoke_full(PRIORITY_DEFAULT, callback)
     }
 
     pub fn invoke_full<F>(&self, priority: gint, callback: F)
-        where F: Send + 'static, F: FnMut() -> bool
+        where F: Send + 'static, F: FnMut() -> CallbackResult
     {
         let boxed_cb = Box::new(callback);
         unsafe {

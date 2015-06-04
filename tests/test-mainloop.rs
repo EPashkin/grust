@@ -18,7 +18,7 @@
 
 extern crate grust;
 
-use grust::mainloop::LoopRunner;
+use grust::mainloop::{LoopRunner, Continue, Remove};
 
 use std::thread;
 
@@ -51,10 +51,10 @@ fn test_invoke() {
                 assert!(thread::current().name() != Some(THREAD_NAME));
                 count += 1;
                 if count < 2 {
-                    true
+                    Continue
                 } else {
                     mlc.quit();
-                    false
+                    Remove
                 }
             });
         }).unwrap();

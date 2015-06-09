@@ -18,13 +18,14 @@
 
 use refcount::{Refcount, Ref};
 use types::{FALSE, TRUE};
-use types::{gboolean, gint, gpointer};
+use types::{gboolean, gint, gpointer, guint};
 use wrap;
 use wrap::Wrapper;
 
 use glib as ffi;
 use gobject;
 use std::boxed::into_raw as box_into_raw;
+use std::convert;
 use std::mem;
 
 pub const PRIORITY_DEFAULT      : gint = ffi::G_PRIORITY_DEFAULT;
@@ -145,6 +146,123 @@ impl Refcount for MainContext {
 }
 
 g_impl_boxed_type_for_ref!(MainContext, gobject::g_main_context_get_type);
+
+#[repr(C)]
+pub struct Source {
+    raw: ffi::GSource
+}
+
+#[repr(C)]
+pub struct AttachedSource {
+    raw: ffi::GSource
+}
+
+unsafe impl Send for Source { }
+
+unsafe impl Send for AttachedSource { }
+unsafe impl Sync for AttachedSource { }
+
+macro_rules! common_source_impls {
+    ($name:ident) => {
+        unsafe impl Wrapper for $name {
+            type Raw = ffi::GSource;
+        }
+
+        impl Refcount for $name {
+            unsafe fn inc_ref(&self) {
+                ffi::g_source_ref(self.as_mut_ptr());
+            }
+            unsafe fn dec_ref(&self) {
+                ffi::g_source_unref(self.as_mut_ptr());
+            }
+        }
+    }
+}
+
+common_source_impls!(Source);
+common_source_impls!(AttachedSource);
+
+impl Source {
+    pub fn set_callback<F>(&self, callback: F)
+        where F: Send + 'static, F: FnMut() -> CallbackResult
+    {
+        let boxed_cb = Box::new(callback);
+        unsafe {
+            ffi::g_source_set_callback(self.as_mut_ptr(),
+                    source_func::<F>,
+                    box_into_raw(boxed_cb) as gpointer,
+                    Some(source_destroy_notify::<F>));
+        }
+    }
+
+    pub fn set_one_time_callback<F>(&self, callback: F)
+        where F: Send + 'static, F: FnOnce()
+    {
+        let boxed_cb = Box::new(Some(callback));
+        unsafe {
+            ffi::g_source_set_callback(self.as_mut_ptr(),
+                    invoke_once_func::<F>,
+                    box_into_raw(boxed_cb) as gpointer,
+                    Some(invoke_once_destroy_notify::<F>));
+        }
+    }
+
+    pub fn set_priority(&self, priority: gint) {
+        unsafe {
+            ffi::g_source_set_priority(self.as_mut_ptr(), priority);
+        }
+    }
+}
+
+impl Ref<Source> {
+    pub fn attach(self, ctx: &MainContext) -> Ref<AttachedSource> {
+        unsafe {
+            let source_ptr = self.as_mut_ptr();
+            ffi::g_source_attach(source_ptr, ctx.as_mut_ptr());
+            mem::forget(self);
+            Ref::from_raw(source_ptr)
+        }
+    }
+}
+
+impl AttachedSource {
+    #[inline]
+    pub fn as_source(&self) -> &Source {
+        unsafe { wrap::from_raw(self.as_ptr()) }
+    }
+
+    pub fn destroy(&self) {
+        unsafe { ffi::g_source_destroy(self.as_mut_ptr()) }
+    }
+}
+
+impl convert::AsRef<Source> for AttachedSource {
+    #[inline]
+    fn as_ref(&self) -> &Source {
+        self.as_source()
+    }
+}
+
+pub fn idle_source_new() -> Ref<Source> {
+    unsafe {
+        let source = ffi::g_idle_source_new();
+        Ref::from_raw(source)
+    }
+}
+
+pub fn timeout_source_new(interval: guint) -> Ref<Source> {
+    unsafe {
+        let source = ffi::g_timeout_source_new(interval);
+        Ref::from_raw(source)
+    }
+}
+
+pub fn timeout_source_new_seconds(interval: guint) -> Ref<Source> {
+    unsafe {
+        let source = ffi::g_timeout_source_new_seconds(interval);
+        Ref::from_raw(source)
+    }
+}
 
 #[repr(C)]
 pub struct MainLoop {

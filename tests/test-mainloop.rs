@@ -18,8 +18,10 @@
 
 extern crate grust;
 
-use grust::mainloop::{LoopRunner, Continue, Remove};
+use grust::mainloop;
+use grust::mainloop::{LoopRunner, Source, Continue, Remove};
 
+use std::sync::mpsc;
 use std::thread;
 
 #[test]
@@ -59,4 +61,106 @@ fn test_invoke() {
             });
         }).unwrap();
     });
+}
+
+#[test]
+fn test_idle_source() {
+    let runner = LoopRunner::new();
+    runner.run_after(|ml| {
+        let source = mainloop::idle_source_new();
+        let mlc = ml.clone();
+        let mut count = 0;
+        source.set_callback(move || {
+            assert!(count <= 2);
+            count += 1;
+            if count < 2 {
+                Continue
+            } else {
+                mlc.quit();
+                Remove
+            }
+        });
+        source.attach(ml.get_context());
+    });
+}
+
+#[test]
+fn test_one_time_callback() {
+    let runner = LoopRunner::new();
+    runner.run_after(|ml| {
+        let source = mainloop::idle_source_new();
+        let mlc = ml.clone();
+        source.set_one_time_callback(move || {
+            mlc.quit();
+        });
+        source.attach(ml.get_context());
+    });
+}
+
+#[test]
+fn test_timeout_source() {
+    let runner = LoopRunner::new();
+    runner.run_after(|ml| {
+        let source = mainloop::timeout_source_new(10);
+        let mlc = ml.clone();
+        source.set_one_time_callback(move || {
+            mlc.quit();
+        });
+        source.attach(ml.get_context());
+    });
+}
+
+#[test]
+fn test_priority() {
+    let (tx, rx) = mpsc::channel();
+    let runner = LoopRunner::new();
+    runner.run_after(|ml| {
+        let source1 = mainloop::idle_source_new();
+        source1.set_priority(mainloop::PRIORITY_DEFAULT);
+        let mut count = 0;
+        source1.set_callback(move || {
+            tx.send(()).unwrap();
+            count += 1;
+            if count == 1 {
+                Remove
+            } else {
+                Continue
+            }
+        });
+        let source2 = mainloop::idle_source_new();
+        let mlc = ml.clone();
+        source2.set_one_time_callback(move || {
+            mlc.quit();
+        });
+        let ctx = ml.get_context();
+        source1.attach(ctx);
+        source2.attach(ctx);
+    });
+    assert_eq!(rx.iter().count(), 1);
+}
+
+#[test]
+fn test_attached_source() {
+    let (tx, rx) = mpsc::channel();
+    let runner = LoopRunner::new();
+    runner.run_after(|ml| {
+        let ctx = ml.get_context();
+        let source1 = mainloop::idle_source_new();
+        let attached = source1.attach(ctx);
+        let attached_source = AsRef::<Source>::as_ref(&*attached);
+        attached_source.set_priority(mainloop::PRIORITY_DEFAULT);
+        let atc = attached.clone();
+        attached.as_source().set_callback(move || {
+            tx.send(()).unwrap();
+            atc.destroy();
+            Continue
+        });
+        let mlc = ml.clone();
+        let source2 = mainloop::idle_source_new();
+        source2.set_one_time_callback(move || {
+            mlc.quit();
+        });
+        source2.attach(ctx);
+    });
+    assert_eq!(rx.iter().count(), 1);
 }

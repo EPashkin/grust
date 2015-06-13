@@ -19,7 +19,8 @@
 extern crate grust;
 
 use grust::mainloop;
-use grust::mainloop::{LoopRunner, Source, Continue, Remove};
+use grust::mainloop::{LoopRunner, Source, SourceCallback};
+use grust::mainloop::CallbackResult::{Continue, Remove};
 
 use std::sync::mpsc;
 use std::thread;
@@ -32,10 +33,10 @@ fn test_invoke_once() {
         thread::Builder::new().name(THREAD_NAME.to_string()).spawn(move || {
             let mlc = mainloop.clone();
             let ctx = mainloop.get_context();
-            ctx.invoke_once(move || {
+            ctx.invoke(SourceCallback::once(move || {
                 assert!(thread::current().name() != Some(THREAD_NAME));
                 mlc.quit();
-            });
+            }));
         }).unwrap();
     });
 }
@@ -49,7 +50,7 @@ fn test_invoke() {
             let mlc = mainloop.clone();
             let mut count = 0;
             let ctx = mainloop.get_context();
-            ctx.invoke(move || {
+            ctx.invoke(SourceCallback::new(move || {
                 assert!(thread::current().name() != Some(THREAD_NAME));
                 count += 1;
                 if count < 2 {
@@ -58,7 +59,7 @@ fn test_invoke() {
                     mlc.quit();
                     Remove
                 }
-            });
+            }));
         }).unwrap();
     });
 }
@@ -70,7 +71,7 @@ fn test_idle_source() {
         let source = mainloop::idle_source_new();
         let mlc = ml.clone();
         let mut count = 0;
-        source.set_callback(move || {
+        source.set_callback(SourceCallback::new(move || {
             assert!(count <= 2);
             count += 1;
             if count < 2 {
@@ -79,7 +80,7 @@ fn test_idle_source() {
                 mlc.quit();
                 Remove
             }
-        });
+        }));
         source.attach(ml.get_context());
     });
 }
@@ -90,9 +91,9 @@ fn test_one_time_callback() {
     runner.run_after(|ml| {
         let source = mainloop::idle_source_new();
         let mlc = ml.clone();
-        source.set_one_time_callback(move || {
+        source.set_callback(SourceCallback::once(move || {
             mlc.quit();
-        });
+        }));
         source.attach(ml.get_context());
     });
 }
@@ -103,9 +104,9 @@ fn test_timeout_source() {
     runner.run_after(|ml| {
         let source = mainloop::timeout_source_new(10);
         let mlc = ml.clone();
-        source.set_one_time_callback(move || {
+        source.set_callback(SourceCallback::once(move || {
             mlc.quit();
-        });
+        }));
         source.attach(ml.get_context());
     });
 }
@@ -118,7 +119,7 @@ fn test_priority() {
         let source1 = mainloop::idle_source_new();
         source1.set_priority(mainloop::PRIORITY_DEFAULT);
         let mut count = 0;
-        source1.set_callback(move || {
+        source1.set_callback(SourceCallback::new(move || {
             tx.send(()).unwrap();
             count += 1;
             if count == 1 {
@@ -126,12 +127,12 @@ fn test_priority() {
             } else {
                 Continue
             }
-        });
+        }));
         let source2 = mainloop::idle_source_new();
         let mlc = ml.clone();
-        source2.set_one_time_callback(move || {
+        source2.set_callback(SourceCallback::once(move || {
             mlc.quit();
-        });
+        }));
         let ctx = ml.get_context();
         source1.attach(ctx);
         source2.attach(ctx);
@@ -147,19 +148,19 @@ fn test_attached_source() {
         let ctx = ml.get_context();
         let source1 = mainloop::idle_source_new();
         let attached = source1.attach(ctx);
-        let attached_source = AsRef::<Source>::as_ref(&*attached);
+        let attached_source: &Source = attached.as_ref();
         attached_source.set_priority(mainloop::PRIORITY_DEFAULT);
         let atc = attached.clone();
-        attached.as_source().set_callback(move || {
+        attached.as_source().set_callback(SourceCallback::new(move || {
             tx.send(()).unwrap();
             atc.destroy();
             Continue
-        });
+        }));
         let mlc = ml.clone();
         let source2 = mainloop::idle_source_new();
-        source2.set_one_time_callback(move || {
+        source2.set_callback(SourceCallback::once(move || {
             mlc.quit();
-        });
+        }));
         source2.attach(ctx);
     });
     assert_eq!(rx.iter().count(), 1);

@@ -26,6 +26,7 @@ use glib as ffi;
 use gobject;
 use std::boxed::into_raw as box_into_raw;
 use std::convert;
+use std::marker;
 use std::mem;
 
 pub const PRIORITY_DEFAULT      : gint = ffi::G_PRIORITY_DEFAULT;
@@ -36,6 +37,81 @@ pub const PRIORITY_LOW          : gint = ffi::G_PRIORITY_LOW;
 
 pub enum CallbackResult { Remove, Continue }
 pub use self::CallbackResult::*;
+
+pub struct RawCallback {
+    func: ffi::GSourceFunc,
+    data: gpointer,
+    destroy: ffi::GDestroyNotify
+}
+
+pub trait Callback {
+    unsafe fn into_raw(self) -> RawCallback;
+}
+
+extern "C" fn box_destroy_notify<T>(raw_data: gpointer)
+{
+    let boxed = unsafe { Box::from_raw(raw_data as *mut T) };
+    mem::drop(boxed);
+}
+
+extern "C" fn source_func<F>(callback_data: gpointer) -> gboolean
+    where F: FnMut() -> CallbackResult
+{
+    let mut callback = unsafe {
+        Box::from_raw(callback_data as *mut F)
+    };
+    let res = callback();
+    mem::forget(callback);
+    match res {
+        Remove => FALSE,
+        Continue => TRUE
+    }
+}
+
+extern "C" fn source_once_func<F>(callback_data: gpointer) -> gboolean
+    where F: FnOnce()
+{
+    let mut holder = unsafe {
+        Box::from_raw(callback_data as *mut Option<F>)
+    };
+    let callback = holder.take().expect("a callback closure expected");
+    mem::forget(holder);
+    callback();
+    FALSE
+}
+
+pub struct SourceCallback(RawCallback);
+
+impl Callback for SourceCallback {
+    #[inline]
+    unsafe fn into_raw(self) -> RawCallback {
+        self.0
+    }
+}
+
+impl SourceCallback {
+    pub fn new<F>(closure: F) -> Self
+        where F: Send + 'static, F: FnMut() -> CallbackResult
+    {
+        let boxed_closure = Box::new(closure);
+        SourceCallback(RawCallback {
+            func: source_func::<F>,
+            data: box_into_raw(boxed_closure) as gpointer,
+            destroy: box_destroy_notify::<F>
+        })
+    }
+
+    pub fn once<F>(closure: F) -> Self
+        where F: Send + 'static, F: FnOnce()
+    {
+        let holder = Box::new(Some(closure));
+        SourceCallback(RawCallback {
+            func: source_once_func::<F>,
+            data: box_into_raw(holder) as gpointer,
+            destroy: box_destroy_notify::<Option<F>>
+        })
+    }
+}
 
 #[repr(C)]
 pub struct MainContext {
@@ -48,46 +124,6 @@ unsafe impl Wrapper for MainContext {
     type Raw = ffi::GMainContext;
 }
 
-extern "C" fn source_func<F>(callback_data: gpointer) -> gboolean
-    where F: FnMut() -> CallbackResult
-{
-    let mut callback: Box<F> = unsafe { Box::from_raw(callback_data as *mut F) };
-    let res = callback();
-    mem::forget(callback);
-    match res {
-        Remove => FALSE,
-        Continue => TRUE
-    }
-}
-
-extern "C" fn source_destroy_notify<F>(callback_data: gpointer)
-    where F: FnMut() -> CallbackResult
-{
-    let callback: Box<F> = unsafe { Box::from_raw(callback_data as *mut F) };
-    mem::drop(callback);
-}
-
-extern "C" fn invoke_once_func<F>(callback_data: gpointer) -> gboolean
-    where F: FnOnce()
-{
-    let mut cbb: Box<Option<F>> = unsafe {
-        Box::from_raw(callback_data as *mut Option<F>)
-    };
-    let callback = cbb.take().expect("a callback closure expected");
-    mem::forget(cbb);
-    callback();
-    FALSE
-}
-
-extern "C" fn invoke_once_destroy_notify<F>(callback_data: gpointer)
-    where F: FnOnce()
-{
-    let cbb: Box<Option<F>> = unsafe {
-        Box::from_raw(callback_data as *mut Option<F>)
-    };
-    mem::drop(cbb);
-}
-
 impl MainContext {
     pub fn default() -> &'static MainContext {
         unsafe {
@@ -95,41 +131,15 @@ impl MainContext {
         }
     }
 
-    pub fn invoke<F>(&self, callback: F)
-        where F: Send + 'static, F: FnMut() -> CallbackResult
-    {
+    pub fn invoke(&self, callback: SourceCallback) {
         self.invoke_full(PRIORITY_DEFAULT, callback)
     }
 
-    pub fn invoke_full<F>(&self, priority: gint, callback: F)
-        where F: Send + 'static, F: FnMut() -> CallbackResult
-    {
-        let boxed_cb = Box::new(callback);
+    pub fn invoke_full(&self, priority: gint, callback: SourceCallback) {
         unsafe {
+            let raw = callback.into_raw();
             ffi::g_main_context_invoke_full(self.as_mut_ptr(),
-                    priority,
-                    source_func::<F>,
-                    box_into_raw(boxed_cb) as gpointer,
-                    Some(source_destroy_notify::<F>));
-        }
-    }
-
-    pub fn invoke_once<F>(&self, callback: F)
-        where F: Send + 'static, F: FnOnce()
-    {
-        self.invoke_once_full(PRIORITY_DEFAULT, callback)
-    }
-
-    pub fn invoke_once_full<F>(&self, priority: gint, callback: F)
-        where F: Send + 'static, F: FnOnce()
-    {
-        let boxed_cb = Box::new(Some(callback));
-        unsafe {
-            ffi::g_main_context_invoke_full(self.as_mut_ptr(),
-                    priority,
-                    invoke_once_func::<F>,
-                    box_into_raw(boxed_cb) as gpointer,
-                    Some(invoke_once_destroy_notify::<F>));
+                    priority, raw.func, raw.data, Some(raw.destroy));
         }
     }
 }
@@ -148,27 +158,29 @@ impl Refcount for MainContext {
 g_impl_boxed_type_for_ref!(MainContext, gobject::g_main_context_get_type);
 
 #[repr(C)]
-pub struct Source {
-    raw: ffi::GSource
+pub struct Source<C: Callback = SourceCallback> {
+    raw: ffi::GSource,
+    phantom_data: marker::PhantomData<C>
 }
 
 #[repr(C)]
-pub struct AttachedSource {
-    raw: ffi::GSource
+pub struct AttachedSource<C: Callback> {
+    raw: ffi::GSource,
+    phantom_data: marker::PhantomData<C>
 }
 
-unsafe impl Send for Source { }
+unsafe impl<C: Callback> Send for Source<C> { }
 
-unsafe impl Send for AttachedSource { }
-unsafe impl Sync for AttachedSource { }
+unsafe impl<C: Callback> Send for AttachedSource<C> { }
+unsafe impl<C: Callback> Sync for AttachedSource<C> { }
 
 macro_rules! common_source_impls {
     ($name:ident) => {
-        unsafe impl Wrapper for $name {
+        unsafe impl<C: Callback> Wrapper for $name<C> {
             type Raw = ffi::GSource;
         }
 
-        impl Refcount for $name {
+        impl<C: Callback> Refcount for $name<C> {
             unsafe fn inc_ref(&self) {
                 ffi::g_source_ref(self.as_mut_ptr());
             }
@@ -182,28 +194,13 @@ macro_rules! common_source_impls {
 common_source_impls!(Source);
 common_source_impls!(AttachedSource);
 
-impl Source {
-    pub fn set_callback<F>(&self, callback: F)
-        where F: Send + 'static, F: FnMut() -> CallbackResult
+impl<C: Callback> Source<C> {
+    pub fn set_callback(&self, callback: C)
     {
-        let boxed_cb = Box::new(callback);
         unsafe {
+            let raw = callback.into_raw();
             ffi::g_source_set_callback(self.as_mut_ptr(),
-                    source_func::<F>,
-                    box_into_raw(boxed_cb) as gpointer,
-                    Some(source_destroy_notify::<F>));
-        }
-    }
-
-    pub fn set_one_time_callback<F>(&self, callback: F)
-        where F: Send + 'static, F: FnOnce()
-    {
-        let boxed_cb = Box::new(Some(callback));
-        unsafe {
-            ffi::g_source_set_callback(self.as_mut_ptr(),
-                    invoke_once_func::<F>,
-                    box_into_raw(boxed_cb) as gpointer,
-                    Some(invoke_once_destroy_notify::<F>));
+                    raw.func, raw.data, Some(raw.destroy));
         }
     }
 
@@ -214,8 +211,8 @@ impl Source {
     }
 }
 
-impl Ref<Source> {
-    pub fn attach(self, ctx: &MainContext) -> Ref<AttachedSource> {
+impl<C: Callback> Ref<Source<C>> {
+    pub fn attach(self, ctx: &MainContext) -> Ref<AttachedSource<C>> {
         unsafe {
             let source_ptr = self.as_mut_ptr();
             ffi::g_source_attach(source_ptr, ctx.as_mut_ptr());
@@ -225,9 +222,9 @@ impl Ref<Source> {
     }
 }
 
-impl AttachedSource {
+impl<C: Callback> AttachedSource<C> {
     #[inline]
-    pub fn as_source(&self) -> &Source {
+    pub fn as_source(&self) -> &Source<C> {
         unsafe { wrap::from_raw(self.as_ptr()) }
     }
 
@@ -236,9 +233,9 @@ impl AttachedSource {
     }
 }
 
-impl convert::AsRef<Source> for AttachedSource {
+impl<C: Callback> convert::AsRef<Source<C>> for AttachedSource<C> {
     #[inline]
-    fn as_ref(&self) -> &Source {
+    fn as_ref(&self) -> &Source<C> {
         self.as_source()
     }
 }
